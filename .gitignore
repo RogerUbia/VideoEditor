@@ -1,0 +1,20 @@
+# API keys and secrets
+.env
+
+# Python cache
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+
+# Video/audio temp files and processed output
+data/temp/
+data/projects/
+data/scripts/
+
+# Claude internal
+.claude/
+
+# OS
+Thumbs.db
+desktop.ini
