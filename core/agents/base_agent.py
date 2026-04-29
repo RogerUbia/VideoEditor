@@ -8,6 +8,20 @@ from typing import Any
 from google import genai
 from google.genai import types as genai_types
 
+# Only models confirmed working — update if quota changes
+WORKING_MODELS = ["gemini-2.5-flash", "gemini-2.5-pro"]
+
+# Global quota status cache: model -> "ok" | "exhausted" | "unknown"
+_quota_status: dict[str, str] = {}
+
+
+def get_quota_status() -> dict[str, str]:
+    return dict(_quota_status)
+
+
+def _mark_quota(model: str, status: str):
+    _quota_status[model] = status
+
 
 @dataclass
 class AgentResult:
@@ -20,19 +34,10 @@ class AgentResult:
     error: str | None = None
 
 
-# Models available — ordered by preference when quota fails
-FALLBACK_MODELS = [
-    "gemini-2.5-flash",
-    "gemini-2.0-flash",
-    "gemini-2.0-flash-lite",
-    "gemini-2.0-flash-001",
-]
-
-
 class BaseVideoAgent:
     MODEL: str = "gemini-2.5-flash"
     SYSTEM_PROMPT: str = ""
-    MAX_RETRIES: int = 3
+    MAX_RETRIES: int = 2
 
     def __init__(self, api_key: str, memory=None):
         self.api_key = api_key
@@ -43,45 +48,121 @@ class BaseVideoAgent:
     def run(self, input_data: dict) -> AgentResult:
         raise NotImplementedError(f"{self.__class__.__name__} must implement run()")
 
-    # ── Core call methods ─────────────────────────────────────────────────────
+    # ── Core call ─────────────────────────────────────────────────────────────
 
     def _call(self, prompt: str, files: list = None, json_mode: bool = False,
               model: str | None = None) -> str:
         model_name = model or self.MODEL
+        return self._call_with_fallback(prompt, files, json_mode, model_name)
+
+    def _call_json(self, prompt: str, files: list = None,
+                   model: str | None = None) -> dict:
+        raw = self._call(prompt, files=files, json_mode=True, model=model)
+        return self._parse_json(raw)
+
+    def _call_thinking(self, prompt: str) -> str:
+        return self._call(prompt, model="gemini-2.5-flash")
+
+    # ── Call with automatic model fallback ───────────────────────────────────
+
+    def _call_with_fallback(self, prompt: str, files, json_mode: bool,
+                            preferred_model: str) -> str:
+        # Build ordered list: preferred first, then others
+        models = [preferred_model] + [m for m in WORKING_MODELS if m != preferred_model]
+
+        last_error = ""
+        for model_name in models:
+            if _quota_status.get(model_name) == "exhausted":
+                self._logger.warning("Skipping %s (quota exhausted)", model_name)
+                continue
+
+            try:
+                result = self._direct_call(model_name, prompt, files, json_mode)
+                _mark_quota(model_name, "ok")
+                return result
+            except Exception as exc:
+                last_error = str(exc)
+                if self._is_quota_exhausted(exc):
+                    _mark_quota(model_name, "exhausted")
+                    self._logger.warning("Model %s daily quota exhausted", model_name)
+                    continue
+                elif self._is_rate_limited(exc):
+                    delay = min(self._extract_retry_delay(exc) or 10, 15)
+                    _mark_quota(model_name, "rate_limited")
+                    self._logger.warning("Model %s rate limited — wait %ds", model_name, int(delay))
+                    time.sleep(delay)
+                    continue
+                elif "404" in last_error or "not found" in last_error.lower():
+                    _mark_quota(model_name, "not_available")
+                    continue
+                elif "503" in last_error or "unavailable" in last_error.lower() or "high demand" in last_error.lower():
+                    _mark_quota(model_name, "unavailable")
+                    self._logger.warning("Model %s unavailable (503) — trying next", model_name)
+                    time.sleep(2)
+                    continue
+                else:
+                    raise
+
+        # All Gemini models exhausted → try Groq Llama (text only, no files)
+        if not files:
+            groq_key = __import__("os").environ.get("GROQ_API_KEY", "")
+            if groq_key:
+                try:
+                    result = self._call_groq_llama(prompt, json_mode, groq_key)
+                    _mark_quota("groq-llama", "ok")
+                    self._logger.info("Used Groq Llama fallback")
+                    return result
+                except Exception as exc:
+                    _mark_quota("groq-llama", "exhausted")
+                    last_error = str(exc)
+
+        raise RuntimeError(
+            f"No working AI model available. Quota exhausted.\n"
+            f"Check: https://ai.dev/rate-limit\nLast error: {last_error}"
+        )
+
+    def _call_groq_llama(self, prompt: str, json_mode: bool, api_key: str) -> str:
+        from groq import Groq
+        client = Groq(api_key=api_key)
+
+        system = self.SYSTEM_PROMPT or "You are a helpful assistant."
+        if json_mode:
+            system += " Always respond with valid JSON only, no markdown."
+
+        response = client.chat.completions.create(
+            model="llama-3.3-70b-versatile",
+            messages=[
+                {"role": "system", "content": system},
+                {"role": "user",   "content": prompt},
+            ],
+            temperature=0.7,
+            max_tokens=8192,
+        )
+        return response.choices[0].message.content
+
+    def _direct_call(self, model_name: str, prompt: str,
+                     files: list | None, json_mode: bool) -> str:
         contents = []
         if files:
             contents.extend(files)
         contents.append(prompt)
 
-        config_kwargs = {}
+        config_kwargs: dict = {}
         if self.SYSTEM_PROMPT:
             config_kwargs["system_instruction"] = self.SYSTEM_PROMPT
         if json_mode:
             config_kwargs["response_mime_type"] = "application/json"
 
-        cfg = genai_types.GenerateContentConfig(**config_kwargs) if config_kwargs else None
+        kwargs: dict = {"model": model_name, "contents": contents}
+        if config_kwargs:
+            kwargs["config"] = genai_types.GenerateContentConfig(**config_kwargs)
 
-        def attempt():
-            kwargs = {"model": model_name, "contents": contents}
-            if cfg:
-                kwargs["config"] = cfg
-            response = self._client.models.generate_content(**kwargs)
-            return response.text
+        response = self._client.models.generate_content(**kwargs)
+        return response.text
 
-        return self._retry_with_fallback(attempt, prompt=prompt, files=files,
-                                         json_mode=json_mode, preferred_model=model_name)
-
-    def _call_json(self, prompt: str, files: list = None, model: str | None = None) -> dict:
-        raw = self._call(prompt, files=files, json_mode=True, model=model)
-        return self._parse_json(raw)
-
-    def _call_thinking(self, prompt: str) -> str:
-        """Use a more capable model for reasoning-heavy tasks."""
-        thinking_model = "gemini-2.5-pro"
-        return self._call(prompt, model=thinking_model)
+    # ── Files API ─────────────────────────────────────────────────────────────
 
     def _upload_audio(self, audio_path: str) -> Any:
-        """Upload audio file using the Files API."""
         return self._client.files.upload(
             file=audio_path,
             config=genai_types.UploadFileConfig(mime_type="audio/wav")
@@ -93,77 +174,36 @@ class BaseVideoAgent:
         except Exception:
             pass
 
-    # ── Retry logic ───────────────────────────────────────────────────────────
+    # ── Quota detection ───────────────────────────────────────────────────────
 
-    def _retry_with_fallback(self, attempt_fn, prompt="", files=None,
-                              json_mode=False, preferred_model: str | None = None) -> str:
-        models_to_try = [preferred_model or self.MODEL] + [
-            m for m in FALLBACK_MODELS if m != (preferred_model or self.MODEL)
-        ]
-        seen = set()
-        last_exc = None
+    @staticmethod
+    def _is_quota_exhausted(exc: Exception) -> bool:
+        msg = str(exc)
+        if "429" not in msg and "RESOURCE_EXHAUSTED" not in msg:
+            return False
+        # Daily quota exhausted — regardless of what the limit number is
+        return "PerDay" in msg or "per_day" in msg.lower()
 
-        for model_name in models_to_try:
-            if model_name in seen:
-                continue
-            seen.add(model_name)
+    @staticmethod
+    def _is_rate_limited(exc: Exception) -> bool:
+        msg = str(exc)
+        if "429" not in msg and "RESOURCE_EXHAUSTED" not in msg:
+            return False
+        # Rate limit (per minute) but NOT daily quota
+        return "PerDay" not in msg and "per_day" not in msg.lower()
 
-            for attempt in range(self.MAX_RETRIES):
-                try:
-                    if model_name == (preferred_model or self.MODEL) and attempt == 0:
-                        return attempt_fn()
-                    else:
-                        # Rebuild call for fallback model
-                        return self._direct_call(
-                            model_name, prompt, files, json_mode
-                        )
-                except Exception as exc:
-                    last_exc = exc
-                    msg = str(exc)
-                    if "429" in msg or "quota" in msg.lower():
-                        delay = self._extract_retry_delay(exc) or (2 ** attempt)
-                        self._logger.warning(
-                            "Quota on %s (attempt %d). Wait %ds…",
-                            model_name, attempt + 1, int(delay)
-                        )
-                        time.sleep(min(delay, 30))
-                        if attempt == self.MAX_RETRIES - 1:
-                            # Move to next model
-                            self._logger.warning("Switching from %s to next model", model_name)
-                            break
-                    elif "404" in msg or "not found" in msg.lower():
-                        self._logger.warning("Model %s not available, trying next", model_name)
-                        break
-                    else:
-                        # Non-quota/404 error — retry same model
-                        if attempt < self.MAX_RETRIES - 1:
-                            time.sleep(2 ** attempt)
-                        else:
-                            raise
+    @staticmethod
+    def _extract_retry_delay(exc: Exception) -> float | None:
+        msg = str(exc)
+        m = re.search(r'seconds["\s:]+(\d+)', msg)
+        if m:
+            return float(m.group(1)) + 1
+        m = re.search(r'retry in ([\d.]+)', msg, re.IGNORECASE)
+        if m:
+            return float(m.group(1)) + 1
+        return None
 
-        raise RuntimeError(
-            f"All models failed. Last error: {last_exc}"
-        )
-
-    def _direct_call(self, model_name: str, prompt: str,
-                     files: list | None, json_mode: bool) -> str:
-        contents = []
-        if files:
-            contents.extend(files)
-        contents.append(prompt)
-
-        config_kwargs = {}
-        if self.SYSTEM_PROMPT:
-            config_kwargs["system_instruction"] = self.SYSTEM_PROMPT
-        if json_mode:
-            config_kwargs["response_mime_type"] = "application/json"
-
-        kwargs = {"model": model_name, "contents": contents}
-        if config_kwargs:
-            kwargs["config"] = genai_types.GenerateContentConfig(**config_kwargs)
-
-        response = self._client.models.generate_content(**kwargs)
-        return response.text
+    # ── Helpers ───────────────────────────────────────────────────────────────
 
     def _retry(self, fn, max_retries: int | None = None):
         retries = max_retries if max_retries is not None else self.MAX_RETRIES
@@ -174,20 +214,14 @@ class BaseVideoAgent:
             except Exception as exc:
                 last_exc = exc
                 if attempt < retries - 1:
-                    wait = self._extract_retry_delay(exc) or (2 ** attempt)
-                    self._logger.warning("Attempt %d/%d failed. Retry in %ds",
-                                         attempt + 1, retries, int(wait))
-                    time.sleep(wait)
+                    time.sleep(2 ** attempt)
         raise last_exc
-
-    # ── Helpers ───────────────────────────────────────────────────────────────
 
     def _parse_json(self, response: str) -> dict:
         text = response.strip()
         if text.startswith("```"):
-            lines = text.split("\n")
             inner, in_block = [], False
-            for line in lines:
+            for line in text.split("\n"):
                 if line.startswith("```"):
                     in_block = not in_block
                     continue
@@ -196,40 +230,25 @@ class BaseVideoAgent:
         try:
             return json.loads(text)
         except json.JSONDecodeError:
-            match = re.search(r'(\{.*\}|\[.*\])', text, re.DOTALL)
-            if match:
+            m = re.search(r'(\{.*\}|\[.*\])', text, re.DOTALL)
+            if m:
                 try:
-                    return json.loads(match.group())
+                    return json.loads(m.group())
                 except json.JSONDecodeError:
                     pass
             raise ValueError(f"Cannot parse JSON: {text[:300]}")
-
-    @staticmethod
-    def _extract_retry_delay(exc: Exception) -> float | None:
-        msg = str(exc)
-        m = re.search(r'seconds:\s*(\d+)', msg)
-        if m:
-            return float(m.group(1)) + 2
-        m = re.search(r'retry in ([\d.]+)', msg, re.IGNORECASE)
-        if m:
-            return float(m.group(1)) + 2
-        return None
 
     def _make_result(self, output, duration_ms: int = 0,
                      confidence: float = 1.0) -> AgentResult:
         return AgentResult(
             agent_name=self.__class__.__name__,
-            success=True,
-            output=output,
-            confidence=confidence,
-            duration_ms=duration_ms,
+            success=True, output=output,
+            confidence=confidence, duration_ms=duration_ms,
         )
 
     def _make_error(self, error: str) -> AgentResult:
         self._logger.error("Agent error: %s", error)
         return AgentResult(
             agent_name=self.__class__.__name__,
-            success=False,
-            output=None,
-            error=error,
+            success=False, output=None, error=error,
         )

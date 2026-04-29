@@ -4,6 +4,14 @@ import json
 import shutil
 from pathlib import Path
 
+# Suppress Qt multimedia / FFmpeg verbose output
+os.environ["QT_LOGGING_RULES"] = (
+    "qt.multimedia.ffmpeg=false;"
+    "qt.multimedia.ffmpeg.warning=false;"
+    "qt.multimedia.decoder=false"
+)
+os.environ["AV_LOG_FORCE_NOCOLOR"] = "1"
+
 from PyQt6.QtWidgets import (QApplication, QMessageBox, QInputDialog,
                               QLineEdit, QSplashScreen, QLabel)
 from PyQt6.QtCore import Qt, QTimer

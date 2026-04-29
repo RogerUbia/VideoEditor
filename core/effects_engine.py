@@ -44,7 +44,13 @@ class EffectsEngine:
         has_music = bool(music_path and os.path.exists(music_path))
         seg_dur = _time_to_s(segment.get("time_end", "0:05")) - _time_to_s(segment.get("time_start", "0:00"))
 
-        cmd = [self.ffmpeg, "-y", "-i", input_path]
+        # Seek to segment start — CRITICAL: without this, all segments
+        # would be extracted from second 0 of the input video
+        seg_start = _time_to_s(segment.get("time_start", "0:00"))
+
+        cmd = [self.ffmpeg, "-y",
+               "-ss", str(seg_start),   # seek before -i (fast input seeking)
+               "-i", input_path]
         if has_pip:
             cmd += ["-i", pip_path]
         if has_music:
@@ -69,6 +75,7 @@ class EffectsEngine:
             "-pix_fmt", "yuv420p",
             "-acodec", "aac", "-b:a", "192k",
             "-t", str(max(0.1, seg_dur)),
+            "-reset_timestamps", "1",   # ensure output timestamps start at 0
             output_path,
         ]
 
@@ -88,7 +95,9 @@ class EffectsEngine:
 
         result = subprocess.run(
             [self.ffmpeg, "-y", "-f", "concat", "-safe", "0",
-             "-i", concat_list, "-c", "copy", output_path],
+             "-i", concat_list, "-c", "copy",
+             "-reset_timestamps", "1",   # continuous timestamps in final video
+             output_path],
             capture_output=True, text=True,
         )
         if result.returncode != 0:

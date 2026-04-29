@@ -6,7 +6,8 @@ from PyQt6.QtWidgets import (
     QWidget, QVBoxLayout, QHBoxLayout, QSplitter,
     QTableWidget, QTableWidgetItem, QHeaderView, QAbstractItemView,
     QTextEdit, QLineEdit, QPushButton, QLabel, QMenu, QComboBox,
-    QCheckBox, QFrame, QSizePolicy,
+    QCheckBox, QFrame, QSizePolicy, QDialog, QDialogButtonBox,
+    QScrollArea,
 )
 from PyQt6.QtCore import (
     Qt, QThread, pyqtSignal, pyqtSlot, QSize,
@@ -496,6 +497,134 @@ class AIChatWidget(QWidget):
         self.history.moveCursor(QTextCursor.MoveOperation.End)
 
 
+# ── Expanded script dialog ───────────────────────────────────────────────────
+
+class ScriptExpandedDialog(QDialog):
+    """Full-screen dialog showing the complete script with all text visible."""
+
+    def __init__(self, segments: list[dict], parent=None):
+        super().__init__(parent)
+        self.setWindowTitle("Script — Vista completa")
+        self.resize(1200, 700)
+        self.setStyleSheet("background:#1A1A1A; color:#FFFFFF;")
+        self._segments = segments
+        self._setup_ui()
+
+    def _setup_ui(self):
+        lo = QVBoxLayout(self)
+        lo.setContentsMargins(12, 12, 12, 12)
+        lo.setSpacing(8)
+
+        # Summary bar
+        total_s = sum(
+            max(0, _t2s(s.get("time_end", "0")) - _t2s(s.get("time_start", "0")))
+            for s in self._segments
+        )
+        m, sec = int(total_s) // 60, int(total_s) % 60
+        effects = sum(
+            1 for s in self._segments
+            if s.get("video_effect", {}).get("type", "none") != "none"
+               or s.get("zoom", {}).get("enabled")
+        )
+        summary = QLabel(
+            f"  {len(self._segments)} segmentos  ·  "
+            f"Duración total estimada: {m}:{sec:02d}  ·  "
+            f"{effects} efectos de video"
+        )
+        summary.setStyleSheet(
+            "background:#6C3BE4; color:white; font-size:13px; font-weight:600;"
+            "padding:8px 12px; border-radius:5px;"
+        )
+        lo.addWidget(summary)
+
+        # Table with full text
+        table = QTableWidget(len(self._segments), 8, self)
+        table.setHorizontalHeaderLabels([
+            "#", "Inicio", "Fin", "Duración", "Contenido del guion",
+            "Mensaje/Nota", "Efectos", "Texto overlay"
+        ])
+        table.horizontalHeader().setStretchLastSection(False)
+        table.horizontalHeader().setSectionResizeMode(4, QHeaderView.ResizeMode.Stretch)
+        table.horizontalHeader().setSectionResizeMode(5, QHeaderView.ResizeMode.Stretch)
+        table.verticalHeader().setVisible(False)
+        table.setAlternatingRowColors(True)
+        table.setEditTriggers(QAbstractItemView.EditTrigger.NoEditTriggers)
+        table.setWordWrap(True)
+        table.setStyleSheet("""
+            QTableWidget { background:#1A1A1A; alternate-background-color:#1F1F1F;
+                           gridline-color:#2D2D2D; font-size:13px; }
+            QTableWidget::item { padding:8px 10px; }
+            QHeaderView::section { background:#242424; color:#888; padding:6px 10px;
+                                   border:none; border-bottom:1px solid #333;
+                                   border-right:1px solid #333; font-weight:600; }
+        """)
+
+        # Fixed widths
+        for col, w in [(0, 36), (1, 90), (2, 90), (3, 70), (6, 130), (7, 150)]:
+            table.setColumnWidth(col, w)
+
+        for i, seg in enumerate(self._segments):
+            start = seg.get("time_start", "00:00:00.000")
+            end   = seg.get("time_end",   "00:00:05.000")
+            dur_s = max(0, _t2s(end) - _t2s(start))
+            dur_m = int(dur_s) // 60
+            dur_sec = int(dur_s) % 60
+            dur_label = f"{dur_m}:{dur_sec:02d}" if dur_m else f"{dur_s:.1f}s"
+
+            # Effects summary
+            fx_parts = []
+            vfx = seg.get("video_effect", {}).get("type", "none")
+            if vfx != "none":
+                fx_parts.append(vfx)
+            if seg.get("zoom", {}).get("enabled"):
+                fx_parts.append(f"zoom×{seg['zoom'].get('factor', 1.3)}")
+            ti = seg.get("transition_in", {}).get("type", "none")
+            if ti != "none":
+                fx_parts.append(f"↓{ti}")
+            if seg.get("pip", {}).get("enabled"):
+                fx_parts.append("PiP")
+            if seg.get("music", {}).get("enabled"):
+                fx_parts.append("♪")
+            fx_str = "  ".join(fx_parts) or "—"
+
+            text_overlay = seg.get("text_overlay", {})
+            text_str = text_overlay.get("text", "") if text_overlay.get("enabled") else "—"
+
+            def cell(text, center=False, color=None, wrap=False):
+                item = QTableWidgetItem(str(text))
+                item.setFlags(item.flags() & ~Qt.ItemFlag.ItemIsEditable)
+                align = Qt.AlignmentFlag.AlignCenter if center else (
+                    Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignTop
+                )
+                item.setTextAlignment(align)
+                if color:
+                    item.setForeground(QBrush(QColor(color)))
+                return item
+
+            table.setItem(i, 0, cell(i + 1, center=True, color="#888"))
+            table.setItem(i, 1, cell(start, center=True))
+            table.setItem(i, 2, cell(end,   center=True))
+            table.setItem(i, 3, cell(dur_label, center=True, color="#9B59B6"))
+            table.setItem(i, 4, cell(seg.get("content", ""), wrap=True))
+            table.setItem(i, 5, cell(seg.get("message", ""), color="#AAAAAA", wrap=True))
+            table.setItem(i, 6, cell(fx_str, color="#9B59B6" if fx_parts else "#555"))
+            table.setItem(i, 7, cell(text_str, color="#F39C12" if text_overlay.get("enabled") else "#555"))
+
+        table.resizeRowsToContents()
+        # Ensure minimum row height so short rows aren't too tight
+        for r in range(table.rowCount()):
+            if table.rowHeight(r) < 42:
+                table.setRowHeight(r, 42)
+
+        lo.addWidget(table, stretch=1)
+
+        # Close button
+        btns = QDialogButtonBox(QDialogButtonBox.StandardButton.Close)
+        btns.rejected.connect(self.reject)
+        btns.setStyleSheet("QPushButton { padding:6px 20px; }")
+        lo.addWidget(btns)
+
+
 # ── Main Script Panel ─────────────────────────────────────────────────────────
 
 class ScriptPanel(QWidget):
@@ -541,6 +670,16 @@ class ScriptPanel(QWidget):
 
         h_lo.addWidget(small_btn("+ Row", self._add_row))
         h_lo.addWidget(small_btn("Clear", self._clear))
+
+        expand_btn = QPushButton("⛶  Vista completa")
+        expand_btn.setFixedHeight(24)
+        expand_btn.setStyleSheet(
+            "QPushButton { background:#6C3BE4; color:white; border:none; "
+            "border-radius:3px; padding:0 8px; font-weight:600; }"
+            "QPushButton:hover { background:#7B4CF0; }"
+        )
+        expand_btn.clicked.connect(self._open_expanded)
+        h_lo.addWidget(expand_btn)
         lo.addWidget(header)
 
         # Splitter: table (top) + chat (bottom)
@@ -597,3 +736,8 @@ class ScriptPanel(QWidget):
         self.table._segments.clear()
         self.table.setRowCount(0)
         self.script_updated.emit({"segments": []})
+
+    def _open_expanded(self):
+        segs = self.table.get_script()
+        dlg = ScriptExpandedDialog(segs, parent=self.window())
+        dlg.exec()

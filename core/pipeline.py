@@ -30,6 +30,7 @@ class PipelineWorker(QThread):
     log_message    = pyqtSignal(str, str)   # (level, message)
     awaiting_approval = pyqtSignal()
     finished_all   = pyqtSignal(dict)
+    interim_update = pyqtSignal(dict)        # intermediate data for timeline
 
     STEPS = [
         "Import & Validate",
@@ -164,6 +165,84 @@ class PipelineWorker(QThread):
                           "duration": dur, "source_video": video_path})
         return f"{os.path.basename(video_path)} ({dur:.1f}s, {w}x{h} @ {fps}fps)"
 
+    # ── Auto-segmentation ─────────────────────────────────────────────────────
+
+    def _auto_segment_from_intervals(self) -> list[dict]:
+        """Create script segments from silence-removal keep_intervals."""
+        import uuid
+
+        intervals = self._tmp.get("keep_intervals", [])
+        if not intervals:
+            dur = self._tmp.get("duration", 60.0)
+            intervals = [{"start_s": 0.0, "end_s": dur, "duration_s": dur}]
+
+        def fmt(s: float) -> str:
+            h = int(s) // 3600
+            m = (int(s) % 3600) // 60
+            sec = s % 60
+            return f"{h:02d}:{m:02d}:{sec:06.3f}"
+
+        # Build cumulative (consecutive) timestamps — no gaps
+        cursor = 0.0
+        segments = []
+        for i, iv in enumerate(intervals):
+            dur   = iv.get("duration_s", iv["end_s"] - iv["start_s"])
+            start = cursor
+            end   = cursor + dur
+            cursor = end
+            segments.append({
+                "id": str(uuid.uuid4()),
+                "order": i,
+                "time_start": fmt(start),
+                "time_end":   fmt(end),
+                "content":    "",
+                "message":    f"Segment {i + 1}",
+                "video_effect":   {"type": "none", "intensity": 1.0},
+                "zoom":           {"enabled": False, "factor": 1.0},
+                "transition_in":  {"type": "none", "duration_s": 0.5},
+                "transition_out": {"type": "none", "duration_s": 0.5},
+                "pip":            {"enabled": False, "source": "none"},
+                "music":          {"enabled": False, "file_path": ""},
+                "text_overlay":   {"enabled": False, "text": ""},
+                "notes":          "Auto-generated from silence detection",
+                "transcription":  "",
+                "validated":      False,
+                "validation_score": 0.0,
+                "is_duplicate":   False,
+                "is_best_take":   True,
+                "effects_ffmpeg": ""
+            })
+        return segments
+
+    def _distribute_transcription(self, transcript: str):
+        """Split transcription text across segments proportionally by duration."""
+        segments = self.project.get("segments", [])
+        if not segments or not transcript:
+            return
+
+        words = transcript.split()
+        if not words:
+            return
+
+        total_dur = sum(
+            max(0, _t2s(s.get("time_end", "0")) - _t2s(s.get("time_start", "0")))
+            for s in segments
+        )
+        if total_dur <= 0:
+            return
+
+        word_idx = 0
+        for seg in segments:
+            seg_dur = max(0, _t2s(seg.get("time_end", "0")) - _t2s(seg.get("time_start", "0")))
+            word_count = max(1, int(len(words) * seg_dur / total_dur))
+            seg_words = words[word_idx: word_idx + word_count]
+            seg["content"] = " ".join(seg_words)
+            word_idx = min(word_idx + word_count, len(words))
+
+        # Give any remaining words to the last segment
+        if word_idx < len(words):
+            segments[-1]["content"] += " " + " ".join(words[word_idx:])
+
     # ── Step 2: Silence removal ───────────────────────────────────────────────
 
     def _step_silence(self, temp_dir: Path, video_path: str, _: str) -> str:
@@ -178,13 +257,37 @@ class PipelineWorker(QThread):
         def cb(p):
             self.progress.emit(int((1 + p / 100) / 8 * 100))
 
-        out, intervals = remover.process(
+        min_seg = self.config.get("silence_min_segment_ms", 1000)
+        png_path = str(temp_dir / "waveform_analysis.png")
+
+        out, intervals, waveform_png = remover.process(
             video_path, output, str(temp_dir),
             threshold_db=threshold, min_duration_ms=min_dur,
-            margin_ms=margin, progress_callback=cb,
+            margin_ms=margin, min_segment_ms=min_seg,
+            progress_callback=cb, waveform_png_path=png_path,
         )
         self._tmp["silence_removed"] = out
         self._tmp["keep_intervals"]  = intervals
+        self._tmp["waveform_png"]    = waveform_png
+
+        self._log("INFO",
+            f"Silence removal: {len(intervals)} segments, "
+            f"waveform → {waveform_png or 'N/A'}"
+        )
+
+        # Auto-create segments if none defined
+        if not self.project.get("segments"):
+            auto_segs = self._auto_segment_from_intervals()
+            self.project = {**self.project, "segments": auto_segs}
+            self._log("INFO", f"Auto-segmentat: {len(auto_segs)} segments des del silenci")
+
+        self.interim_update.emit({
+            "step": "silence",
+            "script": self.project,
+            "silence_removed_path": out,
+            "waveform_png": waveform_png,
+        })
+
         return f"{len(intervals)} segments kept"
 
     # ── Step 3: Transcription ─────────────────────────────────────────────────
@@ -208,6 +311,13 @@ class PipelineWorker(QThread):
             json.dump({"transcript": result.output}, f, ensure_ascii=False)
 
         self._tmp["transcript_raw"] = result.output
+
+        # If segments were auto-created (no content yet), distribute transcription
+        if all(not s.get("content") for s in self.project.get("segments", [])):
+            self._distribute_transcription(result.output)
+            self.interim_update.emit({"step": "transcribe", "script": self.project})
+            self._log("INFO", "Transcripció distribuïda entre els segments automàtics")
+
         return f"{len(result.output)} chars transcribed"
 
     # ── Step 4: Correction ────────────────────────────────────────────────────
@@ -233,12 +343,24 @@ class PipelineWorker(QThread):
     # ── Step 5: Validation ────────────────────────────────────────────────────
 
     def _step_validate(self, temp_dir: Path, *_) -> str:
-        from core.agents.orchestrator import AgentOrchestrator
-
-        orch       = AgentOrchestrator(self.api_key, self.config)
+        segments   = self.project.get("segments", [])
         transcript = self._tmp.get("transcript_corrected", "")
-        result     = orch.validate_script(self.project, transcript)
-        report     = result.output if result.success else {}
+
+        # Skip AI validation if there is no script to compare against
+        if not segments:
+            self._log("INFO", "No script segments — skipping validation (auto-approve)")
+            report = {"overall_match_score": 1.0, "recommendation": "approve",
+                      "notes": "No script provided — validation skipped"}
+            self._tmp["validation_report"] = report
+            path = str(temp_dir / "05_validation_report.json")
+            with open(path, "w", encoding="utf-8") as f:
+                json.dump(report, f, ensure_ascii=False)
+            return "Skipped (no script)"
+
+        from core.agents.orchestrator import AgentOrchestrator
+        orch   = AgentOrchestrator(self.api_key, self.config)
+        result = orch.validate_script(self.project, transcript)
+        report = result.output if result.success else {}
 
         path = str(temp_dir / "05_validation_report.json")
         with open(path, "w", encoding="utf-8") as f:

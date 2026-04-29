@@ -59,6 +59,7 @@ class MainWindow(QMainWindow):
         self.current_video_path: str | None = None
         self.pipeline_worker = None
         self.full_auto_mode = False
+        self._pipeline_duration: float = 60.0
 
         self._build_ui()
         self._build_menu()
@@ -93,7 +94,8 @@ class MainWindow(QMainWindow):
             self.timeline_panel = _TimelinePanel(self)
         else:
             self.timeline_panel = _Placeholder("Timeline", self)
-        self.timeline_panel.setFixedHeight(185)
+        self.timeline_panel.setMinimumHeight(180)
+        self.timeline_panel.setMaximumHeight(500)
 
         if _PropertiesPanel:
             self.properties_panel = _PropertiesPanel(
@@ -254,9 +256,33 @@ class MainWindow(QMainWindow):
         self.pipeline_stopped.connect(lambda: self.process_panel.set_pipeline_running(False))
         self.pipeline_finished.connect(lambda _: self.process_panel.set_pipeline_running(False))
         self.stop_btn.clicked.connect(self.stop_pipeline)
+        self.process_panel.resume_btn.clicked.connect(self._resume_pipeline)
+        self.process_panel.stop_btn.clicked.connect(self.stop_pipeline)
         # Forward segment selection to properties if available
         if _PropertiesPanel and hasattr(self.properties_panel, "load_segment"):
             self.segment_selected.connect(self.properties_panel.load_segment)
+        # Script agent → timeline (actualiza al generar/modificar guion)
+        if _ScriptPanel and _TimelinePanel and hasattr(self.script_panel, "script_updated"):
+            self.script_panel.script_updated.connect(self._on_script_updated)
+
+        # Player position → timeline playhead sync
+        if _TimelinePanel:
+            self.preview_panel.position_changed.connect(
+                self.timeline_panel.set_playhead
+            )
+            self.timeline_panel.seek_requested.connect(self.preview_panel.seek)
+
+        # Timeline ↔ script/properties sync
+        if _TimelinePanel:
+            self.timeline_panel.canvas.clip_selected.connect(
+                self._on_timeline_clip_selected
+            )
+            self.timeline_panel.canvas.clip_trimmed.connect(
+                self._on_clip_trimmed
+            )
+            self.timeline_panel.canvas.clip_moved.connect(
+                self._on_clip_moved
+            )
 
     # ── Geometry ──────────────────────────────────────────────────────────────
 
@@ -371,6 +397,15 @@ class MainWindow(QMainWindow):
         self._video_info_lbl.setText(f"{name}  ({size_mb:.1f} MB)")
         self._status_lbl.setText(f"Loaded: {name}")
         self.process_panel.append_log("INFO", f"Video imported: {path}")
+        # Store duration for timeline (try both APIs)
+        try:
+            duration = self.preview_panel.get_duration()
+            if duration <= 0 and hasattr(self.preview_panel, "player"):
+                duration = self.preview_panel.player.get_duration()
+            if duration > 0:
+                self._pipeline_duration = duration
+        except Exception:
+            pass
 
     # ── Pipeline ──────────────────────────────────────────────────────────────
 
@@ -412,21 +447,24 @@ class MainWindow(QMainWindow):
         self.pipeline_worker.log_message.connect(self.process_panel.append_log)
         self.pipeline_worker.finished_all.connect(self._on_pipeline_done)
         self.pipeline_worker.awaiting_approval.connect(self._on_awaiting_approval)
+        self.pipeline_worker.interim_update.connect(self._on_pipeline_interim)
         self.pipeline_worker.start()
         self.pipeline_started.emit()
         self.process_panel.append_log("STEP", f"Pipeline started [{mode}]")
 
     def _on_awaiting_approval(self):
+        # Show Resume button in process panel (always visible)
+        self.process_panel.resume_btn.setVisible(True)
+        # Also show in toolbar
         self.resume_btn.setVisible(True)
-        self.resume_btn.setStyleSheet("")   # force style refresh
         self.process_panel.append_log(
             "WARNING",
-            "⏸ Pipeline pausado — revisa el guion en la tabla izquierda "
-            "y pulsa  ▶▶ Resume  en la barra de herramientas para continuar."
+            "⏸ Pipeline pausado — revisa el guion y pulsa el botón verde  ▶▶ RESUME"
         )
 
     def _resume_pipeline(self):
         if self.pipeline_worker and self.pipeline_worker.isRunning():
+            self.process_panel.resume_btn.setVisible(False)
             self.resume_btn.setVisible(False)
             self.pipeline_worker.resume()
             self.process_panel.append_log("INFO", "▶ Pipeline reanudado")
@@ -445,8 +483,88 @@ class MainWindow(QMainWindow):
         self.stop_btn.setEnabled(False)
         self.pipeline_finished.emit(outputs)
         self.process_panel.append_log("SUCCESS", "Pipeline completed!")
+
+        # Load output video in preview
         if outputs.get("output_video"):
             self._load_video(outputs["output_video"])
+
+        # Update timeline with full pipeline result
+        if _TimelinePanel:
+            duration = getattr(self, "_pipeline_duration", 60.0)
+            self.process_panel.append_log(
+                "DEBUG",
+                f"Actualizando timeline: {len((outputs.get('script') or {}).get('segments', []))} segmentos, "
+                f"subs CA={bool(outputs.get('subtitles', {}).get('ca'))}, "
+                f"dur={duration:.1f}s"
+            )
+            try:
+                self.timeline_panel.load_from_pipeline_output(outputs, duration)
+                clips = self.timeline_panel.canvas.clips
+                self.process_panel.append_log(
+                    "SUCCESS",
+                    f"Timeline: {len(clips)} clips en {len(set(c.track for c in clips))} pistas"
+                )
+            except Exception as exc:
+                import traceback
+                self.process_panel.append_log("ERROR", f"Timeline update falló: {exc}")
+                self.process_panel.append_log("DEBUG", traceback.format_exc()[:300])
+
+    def _on_pipeline_interim(self, data: dict):
+        """Update timeline and preview with intermediate pipeline data."""
+        # After silence removal: load processed video + open waveform for review
+        silence_path = data.get("silence_removed_path", "")
+        if silence_path and os.path.exists(silence_path):
+            self._load_video(silence_path)
+
+        waveform_png = data.get("waveform_png", "")
+        if waveform_png and os.path.exists(waveform_png):
+            try:
+                os.startfile(waveform_png)   # open in default image viewer
+                self.process_panel.append_log(
+                    "INFO", f"Waveform analysis opened: {waveform_png}"
+                )
+            except Exception:
+                pass
+            # Recalculate duration from the silence-removed file
+            try:
+                import subprocess, json as _json
+                result = subprocess.run(
+                    [self.config.get("ffprobe_path", "ffprobe"),
+                     "-v", "quiet", "-print_format", "json",
+                     "-show_streams", silence_path],
+                    capture_output=True, text=True
+                )
+                meta = _json.loads(result.stdout)
+                for s in meta.get("streams", []):
+                    if "duration" in s:
+                        self._pipeline_duration = float(s["duration"])
+                        break
+            except Exception:
+                pass
+
+        if not _TimelinePanel:
+            return
+        script = data.get("script", {})
+        if not script.get("segments"):
+            return
+        duration = getattr(self, "_pipeline_duration", 60.0)
+        try:
+            self.timeline_panel.load_from_script(script, duration)
+        except Exception:
+            pass
+
+    def _on_script_updated(self, script: dict):
+        """Update timeline immediately when script agent generates/modifies script."""
+        if not _TimelinePanel:
+            return
+        segs = script.get("segments", [])
+        if not segs:
+            return
+        duration = getattr(self, "_pipeline_duration", 60.0)
+        try:
+            self.timeline_panel.load_from_script(script, duration)
+        except Exception as exc:
+            self.process_panel.append_log("WARNING", f"Timeline from script: {exc}")
 
     def _on_mode_toggled(self, checked: bool):
         self.full_auto_mode = checked
@@ -454,6 +572,86 @@ class MainWindow(QMainWindow):
         self.process_panel.append_log(
             "INFO", f"Mode → {'Full Auto' if checked else 'Manual'}"
         )
+
+    # ── Timeline interaction ───────────────────────────────────────────────────
+
+    def _on_timeline_clip_selected(self, clip_id: str):
+        """Sync timeline selection → properties panel + script table scroll."""
+        if not _TimelinePanel:
+            return
+        clip = self.timeline_panel.canvas.get_selected_clip()
+        if not clip or not clip.segment_data:
+            return
+        seg = clip.segment_data
+        # Show in properties panel
+        if _PropertiesPanel and hasattr(self.properties_panel, "load_segment_data"):
+            self.properties_panel.load_segment_data(seg)
+        # Scroll script table to matching row
+        if _ScriptPanel and hasattr(self.script_panel, "table"):
+            table = self.script_panel.table
+            for row in range(table.rowCount()):
+                row_seg = table.get_segment(row)
+                if row_seg and row_seg.get("id") == seg.get("id"):
+                    table.selectRow(row)
+                    table.scrollTo(table.model().index(row, 0))
+                    break
+
+    def _on_clip_trimmed(self, clip_id: str, new_start: float, new_end: float):
+        """Update segment timings in script table when clip is trimmed."""
+        if not _ScriptPanel or not hasattr(self.script_panel, "table"):
+            return
+        table = self.script_panel.table
+        for row in range(table.rowCount()):
+            seg = table.get_segment(row)
+            if seg and seg.get("id") == clip_id:
+                seg["time_start"] = self._s_to_t(new_start)
+                seg["time_end"]   = self._s_to_t(new_end)
+                table.update_segment(row, seg)
+                self.process_panel.append_log(
+                    "INFO",
+                    f"Segment {row + 1} trimmed: "
+                    f"{self._s_to_t(new_start)} → {self._s_to_t(new_end)}"
+                )
+                break
+
+    def _on_clip_moved(self, clip_id: str, new_start: float):
+        """Update segment start time when clip is moved."""
+        if not _ScriptPanel or not hasattr(self.script_panel, "table"):
+            return
+        table = self.script_panel.table
+        for row in range(table.rowCount()):
+            seg = table.get_segment(row)
+            if seg and seg.get("id") == clip_id:
+                dur = (
+                    self._t2s(seg.get("time_end", "0:05"))
+                    - self._t2s(seg.get("time_start", "0:00"))
+                )
+                seg["time_start"] = self._s_to_t(new_start)
+                seg["time_end"]   = self._s_to_t(new_start + dur)
+                table.update_segment(row, seg)
+                break
+
+    @staticmethod
+    def _s_to_t(s: float) -> str:
+        ms = int((s % 1) * 1000)
+        total = int(s)
+        h = total // 3600
+        m = (total % 3600) // 60
+        sec = total % 60
+        return f"{h:02d}:{m:02d}:{sec:02d}.{ms:03d}"
+
+    @staticmethod
+    def _t2s(t: str) -> float:
+        t = t.replace(",", ".")
+        parts = t.split(":")
+        try:
+            if len(parts) == 3:
+                return int(parts[0]) * 3600 + int(parts[1]) * 60 + float(parts[2])
+            if len(parts) == 2:
+                return int(parts[0]) * 60 + float(parts[1])
+        except (ValueError, IndexError):
+            pass
+        return 0.0
 
     def _run_silence_only(self):
         if not self.current_video_path:
