@@ -216,6 +216,27 @@ class MainWindow(QMainWindow):
 
         tb.addSeparator()
 
+        # Subtitle burn toggle — default ON
+        self.subs_btn = QPushButton("CC EN ●")
+        self.subs_btn.setCheckable(True)
+        self.subs_btn.setChecked(self.config.get("burn_subtitles", True))
+        self.subs_btn.setFixedWidth(70)
+        self.subs_btn.setToolTip(
+            "Quemar subtítulos EN en el vídeo exportado.\n"
+            "ON = subtítulos visibles en el video\n"
+            "OFF = solo archivos .srt separados"
+        )
+        self.subs_btn.setStyleSheet(
+            "QPushButton:checked { background:#1E8449; color:white; border:none; "
+            "border-radius:4px; font-weight:700; }"
+            "QPushButton:!checked { background:#333; color:#888; border:none; "
+            "border-radius:4px; }"
+        )
+        self.subs_btn.toggled.connect(self._on_subs_toggled)
+        tb.addWidget(self.subs_btn)
+
+        tb.addSeparator()
+
         mode_lbl = QLabel("Mode: ")
         mode_lbl.setStyleSheet("background:transparent; color:#888; padding:0 4px;")
         tb.addWidget(mode_lbl)
@@ -258,9 +279,20 @@ class MainWindow(QMainWindow):
         self.stop_btn.clicked.connect(self.stop_pipeline)
         self.process_panel.resume_btn.clicked.connect(self._resume_pipeline)
         self.process_panel.stop_btn.clicked.connect(self.stop_pipeline)
-        # Forward segment selection to properties if available
-        if _PropertiesPanel and hasattr(self.properties_panel, "load_segment"):
-            self.segment_selected.connect(self.properties_panel.load_segment)
+        # Script table row click → load in properties panel
+        if _ScriptPanel and _PropertiesPanel:
+            if hasattr(self.script_panel, "segment_selected") and \
+               hasattr(self.properties_panel, "load_segment_data"):
+                self.script_panel.segment_selected.connect(
+                    self.properties_panel.load_segment_data
+                )
+
+        # Properties panel "Apply" → update script table + timeline
+        if _PropertiesPanel and hasattr(self.properties_panel, "segment_changed"):
+            self.properties_panel.segment_changed.connect(
+                self._on_properties_segment_changed
+            )
+
         # Script agent → timeline (actualiza al generar/modificar guion)
         if _ScriptPanel and _TimelinePanel and hasattr(self.script_panel, "script_updated"):
             self.script_panel.script_updated.connect(self._on_script_updated)
@@ -431,8 +463,10 @@ class MainWindow(QMainWindow):
         project = dict(self.current_project)
         if _ScriptPanel and hasattr(self.script_panel, "get_script"):
             project.update(self.script_panel.get_script())
-        project["video_path"] = self.current_video_path
-        project["base_dir"] = str(self.base_dir)
+        project["video_path"]         = self.current_video_path
+        project["base_dir"]           = str(self.base_dir)
+        project["burn_subtitles"]     = self.subs_btn.isChecked()
+        project["burn_subtitle_lang"] = "en"
 
         mode = "full_auto" if self.full_auto_mode else "manual"
         self.pipeline_worker = PipelineWorker(
@@ -488,6 +522,15 @@ class MainWindow(QMainWindow):
         if outputs.get("output_video"):
             self._load_video(outputs["output_video"])
 
+        # Update script table with final enriched segments
+        final_script = outputs.get("script", {})
+        if final_script.get("segments") and _ScriptPanel:
+            if hasattr(self.script_panel, "load_script"):
+                try:
+                    self.script_panel.load_script(final_script)
+                except Exception:
+                    pass
+
         # Update timeline with full pipeline result
         if _TimelinePanel:
             duration = getattr(self, "_pipeline_duration", 60.0)
@@ -508,6 +551,21 @@ class MainWindow(QMainWindow):
                 import traceback
                 self.process_panel.append_log("ERROR", f"Timeline update falló: {exc}")
                 self.process_panel.append_log("DEBUG", traceback.format_exc()[:300])
+
+    def _on_properties_segment_changed(self, segment: dict):
+        """Properties panel 'Apply' → update matching row in script table + timeline."""
+        if not _ScriptPanel or not hasattr(self.script_panel, "table"):
+            return
+        table  = self.script_panel.table
+        seg_id = segment.get("id", "")
+        for row in range(table.rowCount()):
+            s = table.get_segment(row)
+            if s and s.get("id") == seg_id:
+                table.update_segment(row, segment)
+                self.process_panel.append_log(
+                    "INFO", f"Segment {row + 1} updated from Properties"
+                )
+                break
 
     def _on_pipeline_interim(self, data: dict):
         """Update timeline and preview with intermediate pipeline data."""
@@ -542,16 +600,28 @@ class MainWindow(QMainWindow):
             except Exception:
                 pass
 
-        if not _TimelinePanel:
-            return
         script = data.get("script", {})
         if not script.get("segments"):
             return
-        duration = getattr(self, "_pipeline_duration", 60.0)
-        try:
-            self.timeline_panel.load_from_script(script, duration)
-        except Exception:
-            pass
+
+        # Update SCRIPT TABLE with auto-generated segments
+        if _ScriptPanel and hasattr(self.script_panel, "load_script"):
+            try:
+                self.script_panel.load_script(script)
+                n = len(script["segments"])
+                self.process_panel.append_log(
+                    "INFO", f"Script table updated: {n} segments from silence removal"
+                )
+            except Exception as exc:
+                self.process_panel.append_log("WARNING", f"Script table update: {exc}")
+
+        # Update TIMELINE
+        if _TimelinePanel:
+            duration = getattr(self, "_pipeline_duration", 60.0)
+            try:
+                self.timeline_panel.load_from_script(script, duration)
+            except Exception:
+                pass
 
     def _on_script_updated(self, script: dict):
         """Update timeline immediately when script agent generates/modifies script."""
@@ -565,6 +635,20 @@ class MainWindow(QMainWindow):
             self.timeline_panel.load_from_script(script, duration)
         except Exception as exc:
             self.process_panel.append_log("WARNING", f"Timeline from script: {exc}")
+
+    def _on_subs_toggled(self, checked: bool):
+        self.subs_btn.setText("CC EN ●" if checked else "CC EN ○")
+        if self.current_project is not None:
+            self.current_project["burn_subtitles"]     = checked
+            self.current_project["burn_subtitle_lang"] = "en"
+        # Sync Properties panel checkbox
+        if _PropertiesPanel and hasattr(self.properties_panel, "exp_burn_subs"):
+            self.properties_panel.exp_burn_subs.blockSignals(True)
+            self.properties_panel.exp_burn_subs.setChecked(checked)
+            self.properties_panel.exp_burn_subs.blockSignals(False)
+        self.process_panel.append_log(
+            "INFO", f"Subtítulos EN quemados: {'ON' if checked else 'OFF'}"
+        )
 
     def _on_mode_toggled(self, checked: bool):
         self.full_auto_mode = checked

@@ -193,11 +193,30 @@ class PropertiesPanel(QWidget):
         music_lo.addRow("Volume:", vol_widget)
         layout.addWidget(music_box)
 
+        # Usage hint
+        hint = QLabel("← Clic en fila de la tabla o clip del timeline para editar")
+        hint.setStyleSheet(
+            "color:#555; font-size:10px; background:transparent; padding:4px;"
+        )
+        hint.setWordWrap(True)
+        layout.addWidget(hint)
+
         # Apply button
-        apply_btn = QPushButton("Apply to Segment")
+        apply_btn = QPushButton("✓  Apply to Segment")
         apply_btn.setProperty("role", "primary")
+        apply_btn.setFixedHeight(34)
+        apply_btn.setToolTip(
+            "Aplica los cambios al segmento seleccionado.\n"
+            "Primero selecciona un segmento en la tabla o en el timeline."
+        )
         apply_btn.clicked.connect(self._apply_segment)
         layout.addWidget(apply_btn)
+
+        self._apply_status = QLabel("")
+        self._apply_status.setStyleSheet(
+            "color:#2ECC71; font-size:11px; background:transparent; padding:2px 4px;"
+        )
+        layout.addWidget(self._apply_status)
         layout.addStretch()
 
         scroll.setWidget(container)
@@ -206,6 +225,9 @@ class PropertiesPanel(QWidget):
     # ── Video Tab ─────────────────────────────────────────────────────────────
 
     def _make_video_tab(self) -> QWidget:
+        scroll = QScrollArea()
+        scroll.setWidgetResizable(True)
+        scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
         w = QWidget()
         layout = QVBoxLayout(w)
         layout.setContentsMargins(8, 8, 8, 8)
@@ -233,11 +255,15 @@ class PropertiesPanel(QWidget):
         form.addRow("Encode preset:", self.vid_preset)
         layout.addLayout(form)
         layout.addStretch()
-        return w
+        scroll.setWidget(w)
+        return scroll
 
     # ── Audio Tab ─────────────────────────────────────────────────────────────
 
     def _make_audio_tab(self) -> QWidget:
+        scroll = QScrollArea()
+        scroll.setWidgetResizable(True)
+        scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
         w = QWidget()
         layout = QVBoxLayout(w)
         layout.setContentsMargins(8, 8, 8, 8)
@@ -286,14 +312,19 @@ class PropertiesPanel(QWidget):
 
         layout.addWidget(silence_box)
         layout.addStretch()
-        return w
+        scroll.setWidget(w)
+        return scroll
 
     # ── Export Tab ────────────────────────────────────────────────────────────
 
     def _make_export_tab(self) -> QWidget:
+        scroll = QScrollArea()
+        scroll.setWidgetResizable(True)
+        scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
         w = QWidget()
         layout = QVBoxLayout(w)
         layout.setContentsMargins(8, 8, 8, 8)
+        layout.setSpacing(8)
         form = QFormLayout()
 
         self.exp_platform = QComboBox()
@@ -301,27 +332,114 @@ class PropertiesPanel(QWidget):
         form.addRow("Platform:", self.exp_platform)
 
         self.exp_burn_subs = QCheckBox("Burn subtitles into video")
+        self.exp_burn_subs.setChecked(True)          # ON by default
+        self.exp_burn_subs.toggled.connect(self._on_burn_subs_toggled)
         form.addRow(self.exp_burn_subs)
 
         self.exp_sub_lang = QComboBox()
-        self.exp_sub_lang.addItems(["Catalan (CA)", "Spanish (ES)", "English (EN)"])
+        self.exp_sub_lang.addItems(["English (EN)", "Spanish (ES)", "Catalan (CA)"])
         self.exp_sub_lang.setCurrentText("English (EN)")
-        form.addRow("Subtitle language to burn:", self.exp_sub_lang)
-
-        sub_box = QGroupBox("Subtitle Style")
-        sub_form = QFormLayout(sub_box)
-        self.sub_font = QComboBox()
-        self.sub_font.addItems(["Arial", "Helvetica", "Verdana", "Impact", "Georgia"])
-        sub_form.addRow("Font:", self.sub_font)
-        self.sub_size = QSpinBox()
-        self.sub_size.setRange(12, 72)
-        self.sub_size.setValue(28)
-        sub_form.addRow("Size:", self.sub_size)
+        form.addRow("Language:", self.exp_sub_lang)
 
         layout.addLayout(form)
+
+        sub_box = QGroupBox("Subtitle Style")
+        sub_lo = QVBoxLayout(sub_box)
+        sub_lo.setSpacing(6)
+
+        def row(label_text, widget):
+            """Helper: fixed-width label + widget in an HBox."""
+            r = QWidget()
+            r.setStyleSheet("background:transparent;")
+            rl = QHBoxLayout(r)
+            rl.setContentsMargins(0, 0, 0, 0)
+            rl.setSpacing(8)
+            lbl = QLabel(label_text)
+            lbl.setFixedWidth(68)
+            lbl.setStyleSheet("color:#888; font-size:11px; background:transparent;")
+            rl.addWidget(lbl)
+            rl.addWidget(widget, stretch=1)
+            return r
+
+        def slider_row(label_text, slider, value_lbl):
+            r = QWidget()
+            r.setStyleSheet("background:transparent;")
+            rl = QHBoxLayout(r)
+            rl.setContentsMargins(0, 0, 0, 0)
+            rl.setSpacing(8)
+            lbl = QLabel(label_text)
+            lbl.setFixedWidth(68)
+            lbl.setStyleSheet("color:#888; font-size:11px; background:transparent;")
+            rl.addWidget(lbl)
+            rl.addWidget(slider, stretch=1)
+            value_lbl.setFixedWidth(42)
+            value_lbl.setStyleSheet("color:#aaa; font-size:11px; background:transparent;")
+            rl.addWidget(value_lbl)
+            return r
+
+        self.sub_font = QComboBox()
+        self.sub_font.addItems(["Arial", "Helvetica", "Verdana", "Impact", "Georgia"])
+        sub_lo.addWidget(row("Font:", self.sub_font))
+
+        self.sub_size_lbl = QLabel("28 pt")
+        self.sub_size = QSlider(Qt.Orientation.Horizontal)
+        self.sub_size.setRange(12, 72)
+        self.sub_size.setValue(28)
+        self.sub_size.valueChanged.connect(lambda v: self.sub_size_lbl.setText(f"{v} pt"))
+        sub_lo.addWidget(slider_row("Size:", self.sub_size, self.sub_size_lbl))
+
+        style_w = QWidget(); style_w.setStyleSheet("background:transparent;")
+        style_hl = QHBoxLayout(style_w)
+        style_hl.setContentsMargins(0, 0, 0, 0)
+        self.sub_bold   = QCheckBox("Bold")
+        self.sub_italic = QCheckBox("Italic")
+        style_hl.addWidget(self.sub_bold)
+        style_hl.addWidget(self.sub_italic)
+        style_hl.addStretch()
+        sub_lo.addWidget(row("Style:", style_w))
+
+        self.sub_position = QComboBox()
+        self.sub_position.addItems(["Bottom center", "Top center", "Middle center"])
+        sub_lo.addWidget(row("Position:", self.sub_position))
+
+        self.sub_bg_lbl = QLabel("50%")
+        self.sub_bg_opacity = QSlider(Qt.Orientation.Horizontal)
+        self.sub_bg_opacity.setRange(0, 100)
+        self.sub_bg_opacity.setValue(50)
+        self.sub_bg_opacity.valueChanged.connect(lambda v: self.sub_bg_lbl.setText(f"{v}%"))
+        sub_lo.addWidget(slider_row("BG Opacity:", self.sub_bg_opacity, self.sub_bg_lbl))
+
+        self.sub_animation = QComboBox()
+        self.sub_animation.addItems(["Static", "Fade in/out", "Fade in", "Slide up"])
+        self.sub_animation.setCurrentText("Fade in/out")
+        self.sub_animation.setToolTip(
+            "Static: aparece de golpe\n"
+            "Fade in/out: aparece y desaparece suavemente\n"
+            "Fade in: solo aparece suavemente\n"
+            "Slide up: entra desde abajo"
+        )
+        sub_lo.addWidget(row("Animation:", self.sub_animation))
+
+        self.sub_fade_ms_lbl = QLabel("250 ms")
+        self.sub_fade_ms = QSlider(Qt.Orientation.Horizontal)
+        self.sub_fade_ms.setRange(50, 800)
+        self.sub_fade_ms.setValue(250)
+        self.sub_fade_ms.valueChanged.connect(lambda v: self.sub_fade_ms_lbl.setText(f"{v} ms"))
+        sub_lo.addWidget(slider_row("Fade time:", self.sub_fade_ms, self.sub_fade_ms_lbl))
+
         layout.addWidget(sub_box)
         layout.addStretch()
-        return w
+        scroll.setWidget(w)
+        return scroll
+
+    def _on_burn_subs_toggled(self, checked: bool):
+        """Sync with main window toolbar button."""
+        win = self.window()
+        if hasattr(win, "subs_btn"):
+            win.subs_btn.blockSignals(True)
+            win.subs_btn.setChecked(checked)
+            win.subs_btn.setText("CC EN ●" if checked else "CC EN ○")
+            win.subs_btn.blockSignals(False)
 
     # ── API Tab ───────────────────────────────────────────────────────────────
 
@@ -372,6 +490,12 @@ class PropertiesPanel(QWidget):
 
     def _apply_segment(self):
         if self._current_segment is None:
+            self._apply_status.setText("⚠ Selecciona primero un segmento en la tabla o el timeline")
+            self._apply_status.setStyleSheet(
+                "color:#F39C12; font-size:11px; background:transparent; padding:2px 4px;"
+            )
+            from PyQt6.QtCore import QTimer
+            QTimer.singleShot(3000, lambda: self._apply_status.setText(""))
             return
         self._current_segment.update({
             "time_start": self.seg_start.text(),
@@ -414,6 +538,9 @@ class PropertiesPanel(QWidget):
             },
         })
         self.segment_changed.emit(self._current_segment)
+        self._apply_status.setText("✓ Aplicado")
+        from PyQt6.QtCore import QTimer
+        QTimer.singleShot(2000, lambda: self._apply_status.setText(""))
 
     def _save_api(self):
         import os
@@ -471,10 +598,30 @@ class PropertiesPanel(QWidget):
         }
 
     def get_export_config(self) -> dict:
+        lang_map = {"English (EN)": "en", "Spanish (ES)": "es", "Catalan (CA)": "ca"}
+        pos_map  = {
+            "Bottom center": "bottom_center",
+            "Top center":    "top_center",
+            "Middle center": "middle_center",
+        }
+        anim_map = {
+            "Static":      "none",
+            "Fade in/out": "fade",
+            "Fade in":     "fade_in",
+            "Slide up":    "slide_up",
+        }
+        bg_alpha = int((100 - self.sub_bg_opacity.value()) / 100 * 255)
+        bg_hex   = f"#{bg_alpha:02X}000000"
         return {
-            "platform": self.exp_platform.currentText().lower(),
-            "burn_subtitles": self.exp_burn_subs.isChecked(),
-            "subtitle_lang": self.exp_sub_lang.currentText()[:2].lower(),
-            "subtitle_font": self.sub_font.currentText(),
-            "subtitle_size": self.sub_size.value(),
+            "platform":        self.exp_platform.currentText().lower(),
+            "burn_subtitles":  self.exp_burn_subs.isChecked(),
+            "subtitle_lang":   lang_map.get(self.exp_sub_lang.currentText(), "en"),
+            "subtitle_font":   self.sub_font.currentText(),
+            "subtitle_size":   self.sub_size.value(),
+            "subtitle_bold":   self.sub_bold.isChecked(),
+            "subtitle_italic": self.sub_italic.isChecked(),
+            "subtitle_position": pos_map.get(self.sub_position.currentText(), "bottom_center"),
+            "subtitle_bg_color": bg_hex,
+            "subtitle_animation": anim_map.get(self.sub_animation.currentText(), "fade"),
+            "subtitle_fade_ms":  self.sub_fade_ms.value(),
         }

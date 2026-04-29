@@ -505,17 +505,34 @@ class PipelineWorker(QThread):
                 self._tmp[f"srt_{lang}"] = p
 
         # Encode final
-        platform   = script.get("global_settings", {}).get("target_platform", "youtube")
-        output_dir = str(temp_dir / "output")
-        exp        = ExportManager(self.config)
+        global_cfg  = script.get("global_settings", {})
+        platform    = global_cfg.get("target_platform", "youtube")
+        output_dir  = str(temp_dir / "output")
+        exp         = ExportManager(self.config)
+
+        # Subtitle burn config — default ON with English
+        burn_subs   = self.project.get("burn_subtitles",
+                          self.config.get("burn_subtitles", True))
+        burn_lang   = self.project.get("burn_subtitle_lang",
+                          self.config.get("burn_subtitle_lang", "en"))
+        srt_to_burn = self._tmp.get(f"srt_{burn_lang}") or self._tmp.get("srt_ca")
+
+        sub_cfg = {
+            "subtitle_font":  global_cfg.get("subtitle_font",      "Arial"),
+            "subtitle_size":  global_cfg.get("subtitle_font_size",  28),
+            "subtitle_color": global_cfg.get("subtitle_color",      "#FFFFFF"),
+        }
+
+        self._log("INFO",
+            f"Subtitles: burn={'ON' if burn_subs else 'OFF'}, "
+            f"lang={burn_lang}, srt={'found' if srt_to_burn else 'MISSING'}"
+        )
 
         if platform == "instagram":
-            sub_cfg = {
-                "subtitle_font": script["global_settings"].get("subtitle_font", "Arial"),
-                "subtitle_size": script["global_settings"].get("subtitle_font_size", 28),
-            }
             out = exp.export_instagram(
-                source, self._tmp.get("srt_en"), output_dir, project_name, sub_cfg
+                source,
+                srt_to_burn if burn_subs else None,
+                output_dir, project_name, sub_cfg
             )
             for w in out.get("warnings", []):
                 self._log("WARNING", w)
@@ -526,6 +543,8 @@ class PipelineWorker(QThread):
                  "es": self._tmp.get("srt_es"),
                  "en": self._tmp.get("srt_en")},
                 output_dir, project_name,
+                burn_srt=srt_to_burn if burn_subs else None,
+                sub_cfg=sub_cfg,
             )
 
         self._tmp["final_output"] = out.get("output_video", "")
