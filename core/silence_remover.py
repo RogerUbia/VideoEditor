@@ -153,7 +153,8 @@ class SilenceRemover:
         png_out = waveform_png_path or os.path.join(temp_dir, "waveform_analysis.png")
         try:
             self._analyzer.generate_waveform_png(
-                audio_path, silences, keep_intervals, png_out
+                audio_path, silences, keep_intervals, png_out,
+                threshold_db=threshold_db,
             )
         except Exception as e:
             print(f"Waveform PNG failed: {e}")

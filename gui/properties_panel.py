@@ -271,6 +271,7 @@ class PropertiesPanel(QWidget):
         silence_box = QGroupBox("Silence Detection")
         silence_form = QFormLayout(silence_box)
 
+        # Threshold — how quiet = silence
         self.sil_thresh_lbl = QLabel("-40 dB")
         self.sil_thresh = QSlider(Qt.Orientation.Horizontal)
         self.sil_thresh.setRange(-70, -20)
@@ -283,10 +284,14 @@ class PropertiesPanel(QWidget):
         th_row.addWidget(self.sil_thresh_lbl)
         th_w = QWidget(); th_w.setLayout(th_row)
         silence_form.addRow("Threshold:", th_w)
+        thresh_hint = QLabel("−70=muy sensible · −20=solo silencios largos")
+        thresh_hint.setStyleSheet("color:#555; font-size:10px; background:transparent;")
+        silence_form.addRow("", thresh_hint)
 
+        # Min silence duration — shorter = more cuts
         self.sil_dur_lbl = QLabel("500 ms")
         self.sil_dur = QSlider(Qt.Orientation.Horizontal)
-        self.sil_dur.setRange(100, 2000)
+        self.sil_dur.setRange(100, 3000)
         self.sil_dur.setValue(500)
         self.sil_dur.valueChanged.connect(
             lambda v: self.sil_dur_lbl.setText(f"{v} ms")
@@ -295,12 +300,16 @@ class PropertiesPanel(QWidget):
         dur_row.addWidget(self.sil_dur)
         dur_row.addWidget(self.sil_dur_lbl)
         dur_w = QWidget(); dur_w.setLayout(dur_row)
-        silence_form.addRow("Min duration:", dur_w)
+        silence_form.addRow("Min silence:", dur_w)
+        dur_hint = QLabel("Silencios más cortos que esto NO se cortan")
+        dur_hint.setStyleSheet("color:#555; font-size:10px; background:transparent;")
+        silence_form.addRow("", dur_hint)
 
-        self.sil_margin_lbl = QLabel("100 ms")
+        # Margin — buffer left around cuts  ← KEY PARAMETER
+        self.sil_margin_lbl = QLabel("350 ms")
         self.sil_margin = QSlider(Qt.Orientation.Horizontal)
-        self.sil_margin.setRange(0, 500)
-        self.sil_margin.setValue(100)
+        self.sil_margin.setRange(0, 1000)   # up to 1 second margin
+        self.sil_margin.setValue(350)
         self.sil_margin.valueChanged.connect(
             lambda v: self.sil_margin_lbl.setText(f"{v} ms")
         )
@@ -309,6 +318,26 @@ class PropertiesPanel(QWidget):
         mg_row.addWidget(self.sil_margin_lbl)
         mg_w = QWidget(); mg_w.setLayout(mg_row)
         silence_form.addRow("Margin:", mg_w)
+        mg_hint = QLabel("⬆ Sube si se corta el inicio/final de frases")
+        mg_hint.setStyleSheet("color:#2ECC71; font-size:10px; background:transparent;")
+        silence_form.addRow("", mg_hint)
+
+        # Min segment duration — discard very short clips
+        self.sil_min_seg_lbl = QLabel("1000 ms")
+        self.sil_min_seg = QSlider(Qt.Orientation.Horizontal)
+        self.sil_min_seg.setRange(100, 5000)
+        self.sil_min_seg.setValue(1000)
+        self.sil_min_seg.valueChanged.connect(
+            lambda v: self.sil_min_seg_lbl.setText(f"{v} ms")
+        )
+        seg_row = QHBoxLayout()
+        seg_row.addWidget(self.sil_min_seg)
+        seg_row.addWidget(self.sil_min_seg_lbl)
+        seg_w = QWidget(); seg_w.setLayout(seg_row)
+        silence_form.addRow("Min clip:", seg_w)
+        seg_hint = QLabel("Clips más cortos que esto se eliminan")
+        seg_hint.setStyleSheet("color:#555; font-size:10px; background:transparent;")
+        silence_form.addRow("", seg_hint)
 
         layout.addWidget(silence_box)
         layout.addStretch()
@@ -592,9 +621,10 @@ class PropertiesPanel(QWidget):
 
     def get_silence_config(self) -> dict:
         return {
-            "silence_threshold_db": self.sil_thresh.value(),
+            "silence_threshold_db":    self.sil_thresh.value(),
             "silence_min_duration_ms": self.sil_dur.value(),
-            "silence_margin_ms": self.sil_margin.value(),
+            "silence_margin_ms":       self.sil_margin.value(),
+            "silence_min_segment_ms":  self.sil_min_seg.value(),
         }
 
     def get_export_config(self) -> dict:

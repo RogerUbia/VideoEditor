@@ -468,6 +468,16 @@ class MainWindow(QMainWindow):
         project["burn_subtitles"]     = self.subs_btn.isChecked()
         project["burn_subtitle_lang"] = "en"
 
+        # Merge silence config from Properties → Audio sliders
+        if _PropertiesPanel and hasattr(self.properties_panel, "get_silence_config"):
+            sil_cfg = self.properties_panel.get_silence_config()
+            self.config.update({
+                "silence_threshold_db":    sil_cfg.get("silence_threshold_db",    -40),
+                "silence_min_duration_ms": sil_cfg.get("silence_min_duration_ms", 500),
+                "silence_margin_ms":       sil_cfg.get("silence_margin_ms",       350),
+                "silence_min_segment_ms":  sil_cfg.get("silence_min_segment_ms", 1000),
+            })
+
         mode = "full_auto" if self.full_auto_mode else "manual"
         self.pipeline_worker = PipelineWorker(
             project=project, config=self.config,

@@ -94,8 +94,9 @@ class AudioAnalyzer:
         cursor = 0.0
 
         for silence in silences:
-            # Speech ends margin_s before silence starts
-            speech_end = max(cursor, silence["start_s"] - margin_s)
+            # Speech extends margin_s INTO the silence (eat red, not green)
+            sil_mid = (silence["start_s"] + silence["end_s"]) / 2
+            speech_end   = min(silence["start_s"] + margin_s, sil_mid)
             speech_start = cursor
 
             if speech_end > speech_start and (speech_end - speech_start) >= min_segment_s:
@@ -107,8 +108,9 @@ class AudioAnalyzer:
                     "end_ms":     int(speech_end   * 1000),
                 })
 
-            # Next speech starts margin_s after silence ends
-            cursor = min(total_duration_s, silence["end_s"] + margin_s)
+            # Next speech starts margin_s before silence ends (eat into end of red)
+            cursor = max(speech_end + 0.05, silence["end_s"] - margin_s)
+            cursor = max(cursor, sil_mid)
 
         # Final segment after last silence
         if cursor < total_duration_s:
@@ -134,6 +136,7 @@ class AudioAnalyzer:
         output_png: str,
         width: int = 1800,
         height: int = 300,
+        threshold_db: float = -42.0,
     ) -> str:
         """
         Generate a waveform PNG with silence/speech regions color-coded.
@@ -209,7 +212,7 @@ class AudioAnalyzer:
         sil_dur = sum(s["duration_s"] for s in silences)
         stats   = (f"  {n_cuts} segments | "
                    f"{sil_dur:.1f}s silence removed | "
-                   f"threshold: {keep_intervals[0].get('threshold_db', '?')}dB" if keep_intervals else "")
+                   f"threshold: {threshold_db}dB" if keep_intervals else "")
         draw.text((8, height - 36), stats, fill=(150, 150, 150), font=font)
 
         img.save(output_png, "PNG")
