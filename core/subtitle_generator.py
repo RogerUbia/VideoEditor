@@ -26,6 +26,26 @@ class SubtitleGenerator:
             index += 1
         return "\n".join(entries)
 
+    def generate_srt_from_timed(self, timed_segments: list[dict]) -> str:
+        """
+        Generate SRT directly from Whisper timed segments.
+        Each entry has exact start/end timestamps → perfect subtitle alignment.
+        """
+        entries = []
+        index   = 1
+        for seg in timed_segments:
+            text    = seg.get("text", "").strip()
+            start_s = float(seg.get("start", 0.0))
+            end_s   = float(seg.get("end",   start_s + 2.0))
+            if not text:
+                continue
+            if end_s <= start_s:
+                end_s = start_s + 2.0
+            lines = self._wrap_text(text, max_chars=42)
+            entries.append(self._format_entry(index, start_s, end_s, "\n".join(lines)))
+            index += 1
+        return "\n".join(entries)
+
     def translate_srt(
         self,
         srt_content: str,

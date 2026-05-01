@@ -214,6 +214,28 @@ class PipelineWorker(QThread):
             })
         return segments
 
+    def _correct_timed_segments(self, raw: str, corrected: str, timed: list[dict]):
+        """Best-effort: apply correction ratio to timed segment texts."""
+        if not raw.strip():
+            return
+        raw_words       = raw.split()
+        corrected_words = corrected.split()
+        total_raw       = len(raw_words)
+        total_cor       = len(corrected_words)
+        if total_raw == 0:
+            return
+        cursor = 0
+        for seg in timed:
+            seg_words = seg.get("text", "").split()
+            n_seg     = len(seg_words)
+            ratio     = n_seg / total_raw if total_raw else 0
+            n_cor     = max(1, round(ratio * total_cor))
+            seg["text"] = " ".join(corrected_words[cursor: cursor + n_cor])
+            cursor += n_cor
+        # Remainder to last segment
+        if cursor < total_cor and timed:
+            timed[-1]["text"] += " " + " ".join(corrected_words[cursor:])
+
     def _distribute_transcription(self, transcript: str):
         """Split transcription text across segments proportionally by duration."""
         segments = self.project.get("segments", [])
@@ -310,15 +332,28 @@ class PipelineWorker(QThread):
         with open(path, "w", encoding="utf-8") as f:
             json.dump({"transcript": result.output}, f, ensure_ascii=False)
 
-        self._tmp["transcript_raw"] = result.output
+        # result.output is now {"text": str, "timed_segments": list}
+        output = result.output
+        if isinstance(output, dict):
+            full_text      = output.get("text", "")
+            timed_segments = output.get("timed_segments", [])
+        else:
+            full_text      = str(output)
+            timed_segments = []
+
+        self._tmp["transcript_raw"]     = full_text
+        self._tmp["timed_segments"]     = timed_segments
+
+        n_timed = len(timed_segments)
+        self._log("INFO", f"Timed segments from Whisper: {n_timed}")
 
         # If segments were auto-created (no content yet), distribute transcription
         if all(not s.get("content") for s in self.project.get("segments", [])):
-            self._distribute_transcription(result.output)
+            self._distribute_transcription(full_text)
             self.interim_update.emit({"step": "transcribe", "script": self.project})
             self._log("INFO", "Transcripció distribuïda entre els segments automàtics")
 
-        return f"{len(result.output)} chars transcribed"
+        return f"{len(full_text)} chars, {n_timed} timed segments"
 
     # ── Step 4: Correction ────────────────────────────────────────────────────
 
@@ -327,17 +362,30 @@ class PipelineWorker(QThread):
 
         raw = self._tmp.get("transcript_raw", "")
         if not raw:
+            self._tmp["transcript_corrected"] = ""
             return "No transcription to correct"
 
-        orch      = AgentOrchestrator(self.api_key, self.config)
-        result    = orch.correct_text(raw, language="ca")
-        corrected = result.output if result.success else raw
+        try:
+            orch      = AgentOrchestrator(self.api_key, self.config)
+            result    = orch.correct_text(raw, language="ca")
+            corrected = result.output if result.success else raw
+        except Exception as exc:
+            self._log("WARNING", f"Correction skipped (quota?): {exc}")
+            corrected = raw
 
         path = str(temp_dir / "04_transcript_corrected.json")
         with open(path, "w", encoding="utf-8") as f:
             json.dump({"transcript": corrected}, f, ensure_ascii=False)
 
         self._tmp["transcript_corrected"] = corrected
+
+        # Also update timed_segments text if available
+        timed = self._tmp.get("timed_segments", [])
+        if timed and corrected != raw:
+            # Apply correction proportionally to timed segments
+            # (best effort — keeps timing, improves text quality)
+            self._correct_timed_segments(raw, corrected, timed)
+
         return "Transcription corrected"
 
     # ── Step 5: Validation ────────────────────────────────────────────────────
@@ -484,10 +532,16 @@ class PipelineWorker(QThread):
                     if not s.get("is_duplicate", False)]
         source   = self._tmp.get("effects_applied", video_path)
 
-        # Generate Catalan SRT
+        # Generate Catalan SRT — use Whisper timed segments when available
         gen = SubtitleGenerator()
-        srt_ca = gen.generate_srt(segments, "ca")
-        p_ca   = str(temp_dir / "subs_ca.srt")
+        timed_segs = self._tmp.get("timed_segments", [])
+        if timed_segs:
+            srt_ca = gen.generate_srt_from_timed(timed_segs)
+            self._log("INFO", f"SRT CA from Whisper timestamps ({len(timed_segs)} entries)")
+        else:
+            srt_ca = gen.generate_srt(segments, "ca")
+            self._log("INFO", "SRT CA from segment distribution (no timestamps)")
+        p_ca = str(temp_dir / "subs_ca.srt")
         gen.save_srt(srt_ca, p_ca)
         self._tmp["srt_ca"] = p_ca
 
